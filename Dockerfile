@@ -6,6 +6,8 @@ ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV UV_HTTP_TIMEOUT=300
 ENV UV_COMPILE_BYTECODE=1
 ENV PATH="/app/.venv/bin:$PATH"
+# 定义输出目录环境变量
+ENV DOCUTRANSLATE_OUTPUT_DIR="/app/output"
 
 WORKDIR /app
 
@@ -22,8 +24,7 @@ RUN pip install --no-cache-dir uv -i https://pypi.tuna.tsinghua.edu.cn/simple
 # 3. 创建虚拟环境
 RUN uv venv /app/.venv
 
-# 4. 精准安装：只装 docutranslate 的 mcp 扩展
-# 使用 pip install 模式可以完全忽略 pyproject.toml 中的 dev 分组
+# 4. 精准安装
 ARG DOC_VERSION=latest
 RUN if [ "$DOC_VERSION" = "latest" ]; then \
         uv pip install "docutranslate[mcp]"; \
@@ -31,23 +32,24 @@ RUN if [ "$DOC_VERSION" = "latest" ]; then \
         uv pip install "docutranslate[mcp]==${DOC_VERSION}"; \
     fi
 
-# 5. 创建挂载点
-RUN mkdir -p /app/output
-VOLUME /app/output
+# 5. 创建挂载点并赋予权限，防止映射后无写入权限
+RUN mkdir -p ${DOCUTRANSLATE_OUTPUT_DIR} && chmod 777 ${DOCUTRANSLATE_OUTPUT_DIR}
+VOLUME ${DOCUTRANSLATE_OUTPUT_DIR}
 
 ENV DOCUTRANSLATE_PORT=8010
 EXPOSE 8010
 
-# 6. 启动命令
-# 注意：因为我们已经把 .venv/bin 加入了 PATH，直接运行 docutranslate 即可
-# 这样不仅更快，而且绝对不会触发 uv sync 去下载 dev 依赖
-ENTRYPOINT ["docutranslate", "-i", "--with-mcp"]
+# 6. 启动命令（附带轻量级后台清理进程：每小时检查一次，若目录总大小超1024MB，则删除7天前的jsonl文件）
+ENTRYPOINT ["sh", "-c", "while true; do if [ \"$(du -sm $DOCUTRANSLATE_OUTPUT_DIR | awk '{print $1}')\" -gt 1024 ]; then find $DOCUTRANSLATE_OUTPUT_DIR -name '*.jsonl' -type f -mtime +7 -delete; fi; sleep 3600; done & docutranslate -i --with-mcp"]
 
-#docker build --build-arg DOC_VERSION=1.7.0a2 -t xunbu/docutranslate:v1.7.0a2 -t xunbu/docutranslate:latest .
-#docker push xunbu/docutranslate:v1.6.0
-#docker push xunbu/docutranslate:latest
-#docker run -d -p 8010:8010 xunbu/docutranslate:v1.7.0a2
-#docker run -d -p 8010:8010 xunbu/docutranslate:v1.7.0a2 --cors
-#docker run -it -p 8010:8010 xunbu/docutranslate:v1.6.0
-# Web UI: http://127.0.0.1:8010
-# MCP SSE: http://127.0.0.1:8010/mcp/sse
+# ================= 部署及开机自启说明 =================
+# 构建镜像:
+# docker build -t xunbu/docutranslate:latest .
+#
+# 运行并设置开机自启 (--restart=always) 及 目录挂载:
+# docker run -d \
+#   --name docutranslate \
+#   --restart=always \
+#   -p 8010:8010 \
+#   -v $(pwd)/output:/app/output \
+#   xunbu/docutranslate:latest
