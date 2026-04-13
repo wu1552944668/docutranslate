@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2025 QinHan
 # SPDX-License-Identifier: MPL-2.0
 # docutranslate.app.py
+from docutranslate.core.globals import current_task_id
+
 import asyncio
 import base64
 import binascii
@@ -379,7 +381,8 @@ async def service_translate_file(
         ),
 ):
     task_id = uuid.uuid4().hex[:8]
-
+    current_task_id.set(task_id)
+    
     try:
         file_contents = await file.read()
     except Exception as e:
@@ -871,7 +874,8 @@ async def service_flat_translate(
         extra_body_json: Optional[str] = Form("", description="额外请求体参数 JSON 字符串, 会合并到 API 请求中")
 ):
     task_id = uuid.uuid4().hex[:8]
-
+    current_task_id.set(task_id)
+    
     try:
         file_contents = await file.read()
         original_filename = file.filename or "uploaded_file"
