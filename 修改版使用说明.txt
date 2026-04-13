@@ -1,0 +1,26 @@
+1.拉取代码并强制构建
+# 1. 克隆修改后的仓库
+git clone https://github.com/wu1552944668/docutranslate.git
+
+# 2. 进入项目目录
+cd docutranslate
+
+# 3. 强制无缓存构建镜像（这步会花几分钟，因为它会老老实实重新下载和安装所有东西）
+docker build --no-cache -t docutranslate:latest .
+
+2.正确挂载并启动服务
+# 1. 创建宿主机的 output 文件夹，并赋予最高权限，确保容器能往里写数据
+mkdir -p ~/docker_sources/docutranslate/output
+chmod 777 ~/docker_sources/docutranslate/output
+
+# 2. 启动容器，并精准映射端口和目录
+docker run -d \
+  --name docutranslate \
+  --restart=always \
+  -p 8010:8010 \
+  -v ~/docker_sources/docutranslate/output:/app/output \
+  docutranslate:latest
+
+3.验证成果
+watch -n 1 ls -la ~/docker_sources/docutranslate/output
+盯着屏幕，只要第一句话翻译成功（或者遇到死活翻不过去的 524 报错），你就会亲眼看到一个名为 translation_checkpoint_xxxxxx.jsonl （带有一串专属哈希码）的文件诞生！确认文件出现后，按 Ctrl+C 即可退出监控界面。
