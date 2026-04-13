@@ -828,91 +828,73 @@ class Agent:
             result_handler: ResultHandlerType = None,
             error_result_handler: ErrorResultHandlerType = None,
     ) -> list[Any]:
-        max_concurrent = (
-            self.max_concurrent if max_concurrent is None else max_concurrent
-        )
+        max_concurrent = (self.max_concurrent if max_concurrent is None else max_concurrent)
         total = len(prompts)
-        import os
-        import json
-        checkpoint_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
-        checkpoint_file = os.path.join(checkpoint_dir, "translation_checkpoint.jsonl")
         
+        import os, json
+        out_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        checkpoint_file = os.path.join(out_dir, "translation_checkpoint.jsonl")
+        
+        # 1. 读取断点文件（去除模型ID，纯原文匹配）
         cached_results = {}
         if os.path.exists(checkpoint_file):
-            self.logger.info("发现本地断点文件，正在读取已完成进度...")
-            with open(checkpoint_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        record = json.loads(line.strip())
-                        # 仅加载真正成功的记录
+            self.logger.info(f"检查到断点文件: {checkpoint_file}，尝试恢复...")
+            try:
+                with open(checkpoint_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line: continue
+                        record = json.loads(line)
                         if record.get("status") == "success":
-                            # 升级：使用 原文+模型ID 作为唯一钥匙，防止换小说/换模型串车
-                            cache_key = f"{record.get('prompt', '')}_{self.model_id}"
-                            cached_results[cache_key] = record["result"]
-                    except:
-                        pass
-            self.logger.info(f"已恢复 {len(cached_results)} 条历史成功记录。")
+                            p_text = record.get('prompt', '')
+                            # 直接用原文做钥匙，只要属于当前任务的原文就读取
+                            if p_text in prompts:
+                                cached_results[p_text] = record["result"]
+            except Exception as e:
+                self.logger.warning(f"读取断点文件失败: {e}")
         
-        rpm_info = f", RPM:{self.rate_limiter.rpm}" if self.rate_limiter.rpm else ""
-        tpm_info = f", TPM:{self.rate_limiter.tpm}" if self.rate_limiter.tpm else ""
+        if cached_results:
+            self.logger.info(f"已恢复 {len(cached_results)} 条匹配当前任务的记录。")
 
-        self.logger.info(
-            f"provider:{self.provider},base-url:{self.baseurl},model-id:{self.model_id},concurrent:{max_concurrent}{rpm_info}{tpm_info},temperature:{self.temperature},system_proxy:{self.system_proxy_enable},json_output:{force_json}"
-        )
-        self.logger.info(f"预计发送{total}个请求")
+        # 精准计算预计发送数
+        actual_send_count = sum(1 for p in prompts if p not in cached_results)
+        self.logger.info(f"进度统计 - 总数: {total} | 跳过: {total - actual_send_count} | 需发送: {actual_send_count}")
 
-        self.total_error_counter.max_errors_count = (
-                len(prompts) // MAX_REQUESTS_PER_ERROR
-        )
-
+        self.total_error_counter.max_errors_count = len(prompts) // MAX_REQUESTS_PER_ERROR
         self.unresolved_error_count = 0
         self.token_counter.reset()
-
+        
         count = 0
         semaphore = asyncio.Semaphore(max_concurrent)
         tasks = []
-        
         file_lock = asyncio.Lock()
-
+        
         proxies = get_httpx_proxies(asyn=True) if self.system_proxy_enable else None
+        limits = httpx.Limits(max_connections=self.max_concurrent * 2, max_keepalive_connections=self.max_concurrent)
 
-        limits = httpx.Limits(
-            max_connections=self.max_concurrent * 2,
-            max_keepalive_connections=self.max_concurrent,
-        )
-
-        async with httpx.AsyncClient(
-                trust_env=False, mounts=proxies, verify=False, limits=limits
-        ) as client:
+        async with httpx.AsyncClient(trust_env=False, mounts=proxies, verify=False, limits=limits) as client:
             async def send_with_semaphore(index: int, p_text: str):
-                current_cache_key = f"{p_text}_{self.model_id}"
-                if current_cache_key in cached_results:
+                # 命中缓存，直接返回（使用极简 key）
+                if p_text in cached_results:
                     nonlocal count
                     count += 1
-                    return cached_results[current_cache_key]
+                    return cached_results[p_text]
 
                 async with semaphore:
-                    has_failed = False  # 新增：用于悄悄记录是否失败的开关
-                    
-                    # 使用闭包包裹原有的错误处理器
+                    has_failed = False
                     def wrapped_error_handler(p, log):
                         nonlocal has_failed
-                        has_failed = True  # 一旦进入这里，说明重试耗尽，彻底失败
-                        if error_result_handler:
-                            return error_result_handler(p, log) # 依然返回外部期望的内容
-                        return p
+                        has_failed = True
+                        return error_result_handler(p, log) if error_result_handler else p
 
                     result = await self.send_async(
-                        client=client,
-                        prompt=p_text,
-                        system_prompt=system_prompt,
-                        force_json=force_json,
-                        pre_send_handler=pre_send_handler,
-                        result_handler=result_handler,
-                        error_result_handler=wrapped_error_handler, # 传入我们的包裹器
+                        client=client, prompt=p_text, system_prompt=system_prompt,
+                        force_json=force_json, pre_send_handler=pre_send_handler,
+                        result_handler=result_handler, error_result_handler=wrapped_error_handler,
                     )
 
-                    # 3. 写入文件（精准写入状态）
                     async with file_lock:
                         with open(checkpoint_file, "a", encoding="utf-8") as f:
                             record = {
@@ -922,13 +904,13 @@ class Agent:
                                 "result": result
                             }
                             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
+                    
+                    nonlocal count
                     count += 1
                     self.logger.info(f"协程-已完成{count}/{total}")
                     if self.progress_callback:
                         self.progress_callback(count, total)
                     return result
- 
 
             for i, p_text in enumerate(prompts):
                 task = asyncio.create_task(send_with_semaphore(i, p_text))
@@ -936,10 +918,7 @@ class Agent:
 
             results = await asyncio.gather(*tasks, return_exceptions=False)
 
-            self.logger.info(
-                f"所有请求处理完毕。未解决的错误总数: {self.unresolved_error_count}"
-            )
-
+            self.logger.info(f"所有请求处理完毕。未解决的错误总数: {self.unresolved_error_count}")
             token_stats = self.token_counter.get_stats()
             self.logger.info(
                 f"Token使用统计 - 输入: {token_stats['input_tokens'] / 1000:.2f}K(含cached: {token_stats['cached_tokens'] / 1000:.2f}K), "
@@ -947,6 +926,15 @@ class Agent:
                 f"总计: {token_stats['total_tokens'] / 1000:.2f}K"
             )
 
+            # ==================== 极简联动清理逻辑 ====================
+            if self.unresolved_error_count == 0:
+                if os.path.exists(checkpoint_file):
+                    os.remove(checkpoint_file)
+                    self.logger.info("🎉 任务已 100% 成功完成 (未解决错误数为0)，已自动清理本地断点文件。")
+            else:
+                self.logger.warning(f"由于存在 {self.unresolved_error_count} 个未解决的错误，保留断点文件供下次重试。")
+            # ==========================================================
+                    
             return results
 
     def _continue_fetch(
