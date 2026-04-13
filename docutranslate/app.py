@@ -315,7 +315,8 @@ async def service_translate(
         )
 ):
     task_id = uuid.uuid4().hex[:8]
-
+    current_task_id.set(task_id)
+    
     try:
         file_contents = base64.b64decode(request.file_content)
     except (binascii.Error, TypeError) as e:
