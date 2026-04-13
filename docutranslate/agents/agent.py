@@ -834,7 +834,9 @@ class Agent:
         total = len(prompts)
         import os
         import json
-        checkpoint_file = "translation_checkpoint.jsonl"
+        checkpoint_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
+        checkpoint_file = os.path.join(checkpoint_dir, "translation_checkpoint.jsonl")
+        
         cached_results = {}
         if os.path.exists(checkpoint_file):
             self.logger.info("发现本地断点文件，正在读取已完成进度...")
