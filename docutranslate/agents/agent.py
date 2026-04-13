@@ -865,7 +865,15 @@ class Agent:
         self.logger.info(
             f"provider:{self.provider},base-url:{self.baseurl},model-id:{self.model_id},concurrent:{max_concurrent}{rpm_info}{tpm_info},temperature:{self.temperature},system_proxy:{self.system_proxy_enable},json_output:{force_json}"
         )
-        self.logger.info(f"预计发送{total}个请求")
+        
+        # ==================== 修改：精准计算实际需要发送的请求数 ====================
+        # 遍历所有 prompt，如果在缓存里找不到对应的 key，说明需要真实发送
+        actual_send_count = sum(1 for p in prompts if f"{p}_{self.model_id}" not in cached_results)
+        
+        if actual_send_count < total:
+            self.logger.info(f"任务总数: {total} | 命中缓存跳过: {total - actual_send_count} | 预计发送新请求: {actual_send_count}")
+        else:
+            self.logger.info(f"预计发送 {total} 个请求")
 
         self.total_error_counter.max_errors_count = (
                 len(prompts) // MAX_REQUESTS_PER_ERROR
