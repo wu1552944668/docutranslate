@@ -834,42 +834,27 @@ class Agent:
         total = len(prompts)
         import os
         import json
-        import hashlib # 新增导入
         
         checkpoint_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
-        
-        # 核心修改：基于当前要翻译的所有文本，生成一个唯一的任务 MD5 指纹
-        prompt_signature = "".join(prompts).encode("utf-8")
-        task_id = hashlib.md5(prompt_signature).hexdigest()
-        
-        # 让每个任务拥有自己专属的文件，例如：translation_checkpoint_a1b2c3d4...jsonl
-        checkpoint_file = os.path.join(checkpoint_dir, f"translation_checkpoint_{task_id}.jsonl")
+        checkpoint_file = os.path.join(checkpoint_dir, "translation_checkpoint.jsonl")
         
         cached_results = {}
         if os.path.exists(checkpoint_file):
-            self.logger.info(f"发现该任务的专属断点文件 ({task_id[:8]})，正在读取已完成进度...")
+            self.logger.info("发现本地断点文件，正在读取已完成进度...")
             with open(checkpoint_file, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         record = json.loads(line.strip())
                         if record.get("status") == "success":
+                            # 钥匙：原文内容 + 模型ID
                             cache_key = f"{record.get('prompt', '')}_{self.model_id}"
                             cached_results[cache_key] = record["result"]
                     except:
                         pass
             self.logger.info(f"已恢复 {len(cached_results)} 条历史成功记录。")
-        
-        rpm_info = f", RPM:{self.rate_limiter.rpm}" if self.rate_limiter.rpm else ""
-        tpm_info = f", TPM:{self.rate_limiter.tpm}" if self.rate_limiter.tpm else ""
 
-        self.logger.info(
-            f"provider:{self.provider},base-url:{self.baseurl},model-id:{self.model_id},concurrent:{max_concurrent}{rpm_info}{tpm_info},temperature:{self.temperature},system_proxy:{self.system_proxy_enable},json_output:{force_json}"
-        )
-        
-        # ==================== 修改：精准计算实际需要发送的请求数 ====================
-        # 遍历所有 prompt，如果在缓存里找不到对应的 key，说明需要真实发送
+        # 精准计算预计发送数
         actual_send_count = sum(1 for p in prompts if f"{p}_{self.model_id}" not in cached_results)
-        
         if actual_send_count < total:
             self.logger.info(f"任务总数: {total} | 命中缓存跳过: {total - actual_send_count} | 预计发送新请求: {actual_send_count}")
         else:
@@ -960,11 +945,15 @@ class Agent:
                 f"输出: {token_stats['output_tokens'] / 1000:.2f}K(含reasoning: {token_stats['reasoning_tokens'] / 1000:.2f}K), "
                 f"总计: {token_stats['total_tokens'] / 1000:.2f}K"
             )
-            # 如果所有的任务都跑完了，且没有一个失败项（也就是说没有生成带有 __is_failed__ 的字典）
-            if not any(isinstance(r, dict) and r.get("__is_failed__") for r in results):
+            # 检查结果列表中是否包含任何失败标记（字典类型且包含 __is_failed__）
+            has_any_failure = any(isinstance(r, dict) and r.get("__is_failed__") for r in results)
+            
+            if not has_any_failure:
                 if os.path.exists(checkpoint_file):
                     os.remove(checkpoint_file)
-                    self.logger.info(f"任务完美完成，已自动清理专属断点文件: {task_id[:8]}")
+                    self.logger.info("任务已 100% 成功完成，已自动清理本地断点文件。")
+            else:
+                self.logger.warning(f"由于存在 {results.count({'__is_failed__': True})} 个失败项，保留断点文件以供下次重试。")
                     
             return results
 
