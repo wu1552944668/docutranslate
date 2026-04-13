@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2025 QinHan
 # SPDX-License-Identifier: MPL-2.0
+from docutranslate.core.globals import current_task_id
 
 import asyncio
 import itertools
@@ -640,31 +641,39 @@ class Agent:
         total = len(prompts)
         
         import os, json
-        out_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
-        checkpoint_file = os.path.join(out_dir, "translation_checkpoint.jsonl")
         
-        # 1. 读取断点文件（去除模型ID，纯原文匹配）
+        # ==================== 核心：通过上下文盲抓 task_id ====================
+        task_id = current_task_id.get()
+        checkpoint_file = None
         cached_results = {}
-        if os.path.exists(checkpoint_file):
-            self.logger.info(f"检查到断点文件: {checkpoint_file}，尝试恢复...")
-            try:
-                with open(checkpoint_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line: continue
-                        record = json.loads(line)
-                        if record.get("status") == "success":
-                            p_text = record.get('prompt', '')
-                            # 直接用原文做钥匙，只要属于当前任务的原文就读取
-                            if p_text in prompts:
-                                cached_results[p_text] = record["result"]
-            except Exception as e:
-                self.logger.warning(f"读取断点文件失败: {e}")
         
-        if cached_results:
-            self.logger.info(f"已恢复 {len(cached_results)} 条匹配当前任务的记录。")
+        if task_id:
+            out_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            checkpoint_file = os.path.join(out_dir, f"checkpoint_{task_id}.jsonl")
+            
+            # 1. 读取断点文件（纯原文匹配）
+            if os.path.exists(checkpoint_file):
+                self.logger.info(f"检查到专属任务断点文件: {os.path.basename(checkpoint_file)}，尝试恢复...")
+                try:
+                    with open(checkpoint_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line: continue
+                            record = json.loads(line)
+                            if record.get("status") == "success":
+                                p_text = record.get('prompt', '')
+                                if p_text in prompts:
+                                    cached_results[p_text] = record["result"]
+                except Exception as e:
+                    self.logger.warning(f"读取断点文件失败: {e}")
+            
+            if cached_results:
+                self.logger.info(f"已恢复 {len(cached_results)} 条历史记录。")
+        else:
+            self.logger.warning("未获取到 task_id，本次任务将不使用断点续传缓存功能。")
+        # ==============================================================================
 
         # 2. 精准计算预计发送数
         actual_send_count = sum(1 for p in prompts if p not in cached_results)
@@ -691,10 +700,8 @@ class Agent:
 
         async with httpx.AsyncClient(trust_env=False, mounts=proxies, verify=False, limits=limits) as client:
             async def send_with_semaphore(index: int, p_text: str):
-                # 修复核心：将 nonlocal 声明放到函数绝对的第一行
                 nonlocal count
-                
-                # 命中缓存，直接返回（使用极简 key）
+                # 命中缓存，直接返回
                 if p_text in cached_results:
                     count += 1
                     return cached_results[p_text]
@@ -713,21 +720,51 @@ class Agent:
                         result_handler=result_handler, error_result_handler=wrapped_error_handler,
                     )
 
-                    async with file_lock:
-                        with open(checkpoint_file, "a", encoding="utf-8") as f:
-                            record = {
-                                "index": index,
-                                "status": "failed" if has_failed else "success",
-                                "prompt": p_text,
-                                "result": result
-                            }
-                            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    # 仅在获取到了 checkpoint_file 路径时才写入文件
+                    if checkpoint_file:
+                        async with file_lock:
+                            with open(checkpoint_file, "a", encoding="utf-8") as f:
+                                record = {
+                                    "index": index,
+                                    "status": "failed" if has_failed else "success",
+                                    "prompt": p_text,
+                                    "result": result
+                                }
+                                f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     
                     count += 1
                     self.logger.info(f"协程-已完成{count}/{total}")
                     if self.progress_callback:
                         self.progress_callback(count, total)
                     return result
+
+            for i, p_text in enumerate(prompts):
+                task = asyncio.create_task(send_with_semaphore(i, p_text))
+                tasks.append(task)
+
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            self.logger.info(f"所有请求处理完毕。未解决的错误总数: {self.unresolved_error_count}")
+            token_stats = self.token_counter.get_stats()
+            self.logger.info(
+                f"Token使用统计 - 输入: {token_stats['input_tokens'] / 1000:.2f}K(含cached: {token_stats['cached_tokens'] / 1000:.2f}K), "
+                f"输出: {token_stats['output_tokens'] / 1000:.2f}K(含reasoning: {token_stats['reasoning_tokens'] / 1000:.2f}K), "
+                f"总计: {token_stats['total_tokens'] / 1000:.2f}K"
+            )
+
+            # ==================== 3. 极简联动清理逻辑 ====================
+            if checkpoint_file:
+                if self.unresolved_error_count == 0:
+                    if os.path.exists(checkpoint_file):
+                        try:
+                            os.remove(checkpoint_file)
+                            self.logger.info("🎉 任务已 100% 成功完成，已自动清理本地专属断点文件。")
+                        except OSError as e:
+                            self.logger.error(f"清理断点文件失败: {e}")
+                else:
+                    self.logger.warning(f"由于存在 {self.unresolved_error_count} 个未解决的错误，保留断点文件供下次重试。")
+                    
+            return results
 
             for i, p_text in enumerate(prompts):
                 task = asyncio.create_task(send_with_semaphore(i, p_text))
