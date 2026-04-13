@@ -639,6 +639,7 @@ class Agent:
         max_concurrent = (self.max_concurrent if max_concurrent is None else max_concurrent)
         total = len(prompts)
         
+        import os, json
         out_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
         if not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=True)
@@ -690,9 +691,11 @@ class Agent:
 
         async with httpx.AsyncClient(trust_env=False, mounts=proxies, verify=False, limits=limits) as client:
             async def send_with_semaphore(index: int, p_text: str):
+                # 修复核心：将 nonlocal 声明放到函数绝对的第一行
+                nonlocal count
+                
                 # 命中缓存，直接返回（使用极简 key）
                 if p_text in cached_results:
-                    nonlocal count
                     count += 1
                     return cached_results[p_text]
 
@@ -720,7 +723,6 @@ class Agent:
                             }
                             f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     
-                    nonlocal count
                     count += 1
                     self.logger.info(f"协程-已完成{count}/{total}")
                     if self.progress_callback:
