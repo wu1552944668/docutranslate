@@ -844,8 +844,11 @@ class Agent:
                 for line in f:
                     try:
                         record = json.loads(line.strip())
+                        # 仅加载真正成功的记录
                         if record.get("status") == "success":
-                            cached_results[record["index"]] = record["result"]
+                            # 升级：使用 原文+模型ID 作为唯一钥匙，防止换小说/换模型串车
+                            cache_key = f"{record.get('prompt', '')}_{self.model_id}"
+                            cached_results[cache_key] = record["result"]
                     except:
                         pass
             self.logger.info(f"已恢复 {len(cached_results)} 条历史成功记录。")
@@ -882,16 +885,22 @@ class Agent:
                 trust_env=False, mounts=proxies, verify=False, limits=limits
         ) as client:
             async def send_with_semaphore(index: int, p_text: str):
-                if index in cached_results:
+                current_cache_key = f"{p_text}_{self.model_id}"
+                if current_cache_key in cached_results:
                     nonlocal count
                     count += 1
-                    return cached_results[index]
+                    return cached_results[current_cache_key]
 
                 async with semaphore:
-                    def mark_failure(p, log):
-                        return {"__is_failed__": True, "prompt": p}
+                    has_failed = False  # 新增：用于悄悄记录是否失败的开关
                     
-                    actual_error_handler = error_result_handler or mark_failure
+                    # 使用闭包包裹原有的错误处理器
+                    def wrapped_error_handler(p, log):
+                        nonlocal has_failed
+                        has_failed = True  # 一旦进入这里，说明重试耗尽，彻底失败
+                        if error_result_handler:
+                            return error_result_handler(p, log) # 依然返回外部期望的内容
+                        return p
 
                     result = await self.send_async(
                         client=client,
@@ -900,16 +909,16 @@ class Agent:
                         force_json=force_json,
                         pre_send_handler=pre_send_handler,
                         result_handler=result_handler,
-                        error_result_handler=actual_error_handler,
+                        error_result_handler=wrapped_error_handler, # 传入我们的包裹器
                     )
 
-                    is_failed = isinstance(result, dict) and result.get("__is_failed__") is True
-
+                    # 3. 写入文件（精准写入状态）
                     async with file_lock:
                         with open(checkpoint_file, "a", encoding="utf-8") as f:
                             record = {
                                 "index": index,
-                                "status": "failed" if is_failed else "success",
+                                "status": "failed" if has_failed else "success",
+                                "prompt": p_text,
                                 "result": result
                             }
                             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -919,6 +928,7 @@ class Agent:
                     if self.progress_callback:
                         self.progress_callback(count, total)
                     return result
+ 
 
             for i, p_text in enumerate(prompts):
                 task = asyncio.create_task(send_with_semaphore(i, p_text))
