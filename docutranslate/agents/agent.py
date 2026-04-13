@@ -832,6 +832,22 @@ class Agent:
             self.max_concurrent if max_concurrent is None else max_concurrent
         )
         total = len(prompts)
+        import os
+        import json
+        checkpoint_file = "translation_checkpoint.jsonl"
+        cached_results = {}
+        if os.path.exists(checkpoint_file):
+            self.logger.info("发现本地断点文件，正在读取已完成进度...")
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        record = json.loads(line.strip())
+                        if record.get("status") == "success":
+                            cached_results[record["index"]] = record["result"]
+                    except:
+                        pass
+            self.logger.info(f"已恢复 {len(cached_results)} 条历史成功记录。")
+        
         rpm_info = f", RPM:{self.rate_limiter.rpm}" if self.rate_limiter.rpm else ""
         tpm_info = f", TPM:{self.rate_limiter.tpm}" if self.rate_limiter.tpm else ""
 
@@ -850,6 +866,8 @@ class Agent:
         count = 0
         semaphore = asyncio.Semaphore(max_concurrent)
         tasks = []
+        
+        file_lock = asyncio.Lock()
 
         proxies = get_httpx_proxies(asyn=True) if self.system_proxy_enable else None
 
@@ -861,11 +879,18 @@ class Agent:
         async with httpx.AsyncClient(
                 trust_env=False, mounts=proxies, verify=False, limits=limits
         ) as client:
-            async def send_with_semaphore(p_text: str):
+            async def send_with_semaphore(index: int, p_text: str):
+                if index in cached_results:
+                    nonlocal count
+                    count += 1
+                    return cached_results[index]
+
                 async with semaphore:
-                    # 注意：我们在 semaphore 内部调用 send_async
-                    # send_async 内部会调用 rate_limiter.acquire_async
-                    # 这样可以防止并发过高，同时 rate_limiter 防止频率过快
+                    def mark_failure(p, log):
+                        return {"__is_failed__": True, "prompt": p}
+                    
+                    actual_error_handler = error_result_handler or mark_failure
+
                     result = await self.send_async(
                         client=client,
                         prompt=p_text,
@@ -873,18 +898,28 @@ class Agent:
                         force_json=force_json,
                         pre_send_handler=pre_send_handler,
                         result_handler=result_handler,
-                        error_result_handler=error_result_handler,
+                        error_result_handler=actual_error_handler,
                     )
-                    nonlocal count
+
+                    is_failed = isinstance(result, dict) and result.get("__is_failed__") is True
+
+                    async with file_lock:
+                        with open(checkpoint_file, "a", encoding="utf-8") as f:
+                            record = {
+                                "index": index,
+                                "status": "failed" if is_failed else "success",
+                                "result": result
+                            }
+                            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
                     count += 1
                     self.logger.info(f"协程-已完成{count}/{total}")
-                    # 调用进度回调
                     if self.progress_callback:
                         self.progress_callback(count, total)
                     return result
 
-            for p_text in prompts:
-                task = asyncio.create_task(send_with_semaphore(p_text))
+            for i, p_text in enumerate(prompts):
+                task = asyncio.create_task(send_with_semaphore(i, p_text))
                 tasks.append(task)
 
             results = await asyncio.gather(*tasks, return_exceptions=False)
