@@ -834,19 +834,25 @@ class Agent:
         total = len(prompts)
         import os
         import json
+        import hashlib # 新增导入
+        
         checkpoint_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
-        checkpoint_file = os.path.join(checkpoint_dir, "translation_checkpoint.jsonl")
+        
+        # 核心修改：基于当前要翻译的所有文本，生成一个唯一的任务 MD5 指纹
+        prompt_signature = "".join(prompts).encode("utf-8")
+        task_id = hashlib.md5(prompt_signature).hexdigest()
+        
+        # 让每个任务拥有自己专属的文件，例如：translation_checkpoint_a1b2c3d4...jsonl
+        checkpoint_file = os.path.join(checkpoint_dir, f"translation_checkpoint_{task_id}.jsonl")
         
         cached_results = {}
         if os.path.exists(checkpoint_file):
-            self.logger.info("发现本地断点文件，正在读取已完成进度...")
+            self.logger.info(f"发现该任务的专属断点文件 ({task_id[:8]})，正在读取已完成进度...")
             with open(checkpoint_file, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         record = json.loads(line.strip())
-                        # 仅加载真正成功的记录
                         if record.get("status") == "success":
-                            # 升级：使用 原文+模型ID 作为唯一钥匙，防止换小说/换模型串车
                             cache_key = f"{record.get('prompt', '')}_{self.model_id}"
                             cached_results[cache_key] = record["result"]
                     except:
@@ -946,7 +952,12 @@ class Agent:
                 f"输出: {token_stats['output_tokens'] / 1000:.2f}K(含reasoning: {token_stats['reasoning_tokens'] / 1000:.2f}K), "
                 f"总计: {token_stats['total_tokens'] / 1000:.2f}K"
             )
-
+            # 如果所有的任务都跑完了，且没有一个失败项（也就是说没有生成带有 __is_failed__ 的字典）
+            if not any(isinstance(r, dict) and r.get("__is_failed__") for r in results):
+                if os.path.exists(checkpoint_file):
+                    os.remove(checkpoint_file)
+                    self.logger.info(f"任务完美完成，已自动清理专属断点文件: {task_id[:8]}")
+                    
             return results
 
     def _continue_fetch(
