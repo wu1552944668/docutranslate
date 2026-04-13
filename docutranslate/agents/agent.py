@@ -879,11 +879,52 @@ class Agent:
         async with httpx.AsyncClient(
                 trust_env=False, mounts=proxies, verify=False, limits=limits
         ) as client:
-            async def send_with_semaphore(index: int, p_text: str):
+async def send_with_semaphore(index: int, p_text: str):
                 if index in cached_results:
                     nonlocal count
                     count += 1
                     return cached_results[index]
+
+                async with semaphore:
+                    # 拦截器：无论外层有没有 error_handler，我们强制接管并打上失败标记
+                    def intercept_error(p, log):
+                        # 如果外层传了处理函数，先执行外层的拿到备用结果（通常是原文）
+                        fallback_res = error_result_handler(p, log) if error_result_handler else p
+                        # 包装成带有标记的字典
+                        return {"__is_failed__": True, "fallback": fallback_res}
+
+                    result = await self.send_async(
+                        client=client,
+                        prompt=p_text,
+                        system_prompt=system_prompt,
+                        force_json=force_json,
+                        pre_send_handler=pre_send_handler,
+                        result_handler=result_handler,
+                        error_result_handler=intercept_error, # 强制使用拦截器
+                    )
+
+                    # 判定是否彻底失败
+                    is_failed = isinstance(result, dict) and result.get("__is_failed__") is True
+                    
+                    # 【核心】剥离标记，还原真实结果！绝不能把 dict 丢给外层框架，否则会引发异常或输出乱码
+                    final_result = result.get("fallback") if is_failed else result
+
+                    # 写入记录（此时即使是 failed，写进去的 result 也是安全的原文）
+                    async with file_lock:
+                        with open(checkpoint_file, "a", encoding="utf-8") as f:
+                            record = {
+                                "index": index,
+                                "status": "failed" if is_failed else "success",
+                                "result": final_result
+                            }
+                            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                    count += 1
+                    self.logger.info(f"协程-已完成{count}/{total}")
+                    if self.progress_callback:
+                        self.progress_callback(count, total)
+                    
+                    return final_result
 
                 async with semaphore:
                     def mark_failure(p, log):
