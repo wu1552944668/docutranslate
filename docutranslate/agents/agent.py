@@ -28,7 +28,7 @@ ThinkingMode = Literal["enable", "disable", "default"]
 
 
 def _parse_response_json(response: httpx.Response) -> dict:
-"""
+    """
    解析API响应，正确处理前缀空行（如DeepSeek API在高负载时返回的空行）
 
    Args:
