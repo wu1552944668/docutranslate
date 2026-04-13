@@ -6,7 +6,6 @@ ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV UV_HTTP_TIMEOUT=300
 ENV UV_COMPILE_BYTECODE=1
 ENV PATH="/app/.venv/bin:$PATH"
-# 定义输出目录环境变量
 ENV DOCUTRANSLATE_OUTPUT_DIR="/app/output"
 
 WORKDIR /app
@@ -24,32 +23,18 @@ RUN pip install --no-cache-dir uv -i https://pypi.tuna.tsinghua.edu.cn/simple
 # 3. 创建虚拟环境
 RUN uv venv /app/.venv
 
-# 4. 精准安装
-ARG DOC_VERSION=latest
-RUN if [ "$DOC_VERSION" = "latest" ]; then \
-        uv pip install "docutranslate[mcp]"; \
-    else \
-        uv pip install "docutranslate[mcp]==${DOC_VERSION}"; \
-    fi
+# 4. 【核心修复：将当前目录下所有你修改过的代码复制到容器的 /app 目录】
+COPY . /app
 
-# 5. 创建挂载点并赋予权限，防止映射后无写入权限
+# 5. 【核心修复：从刚才拷贝进来的本地代码进行安装，而不是去网上拉取】
+RUN uv pip install ".[mcp]"
+
+# 6. 创建挂载点
 RUN mkdir -p ${DOCUTRANSLATE_OUTPUT_DIR} && chmod 777 ${DOCUTRANSLATE_OUTPUT_DIR}
 VOLUME ${DOCUTRANSLATE_OUTPUT_DIR}
 
 ENV DOCUTRANSLATE_PORT=8010
 EXPOSE 8010
 
-# 6. 启动命令（附带轻量级后台清理进程：每小时检查一次，若目录总大小超1024MB，则删除7天前的jsonl文件）
+# 7. 启动命令
 ENTRYPOINT ["sh", "-c", "while true; do if [ \"$(du -sm $DOCUTRANSLATE_OUTPUT_DIR | awk '{print $1}')\" -gt 1024 ]; then find $DOCUTRANSLATE_OUTPUT_DIR -name '*.jsonl' -type f -mtime +7 -delete; fi; sleep 3600; done & docutranslate -i --with-mcp"]
-
-# ================= 部署及开机自启说明 =================
-# 构建镜像:
-# docker build -t xunbu/docutranslate:latest .
-#
-# 运行并设置开机自启 (--restart=always) 及 目录挂载:
-# docker run -d \
-#   --name docutranslate \
-#   --restart=always \
-#   -p 8010:8010 \
-#   -v $(pwd)/output:/app/output \
-#   xunbu/docutranslate:latest
