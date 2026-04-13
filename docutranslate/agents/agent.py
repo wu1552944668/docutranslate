@@ -819,126 +819,129 @@ else error_result_handler(prompt, self.logger)
 )
 
 async def send_prompts_async(
-self,
-prompts: list[str],
-system_prompt: str | None = None,
-max_concurrent: int | None = None,
-force_json=False,
-pre_send_handler: PreSendHandlerType = None,
-result_handler: ResultHandlerType = None,
-error_result_handler: ErrorResultHandlerType = None,
+        self,
+        prompts: list[str],
+        system_prompt: str | None = None,
+        max_concurrent: int | None = None,
+        force_json=False,
+        pre_send_handler: PreSendHandlerType = None,
+        result_handler: ResultHandlerType = None,
+        error_result_handler: ErrorResultHandlerType = None,
 ) -> list[Any]:
-max_concurrent = (
-self.max_concurrent if max_concurrent is None else max_concurrent
-)
-total = len(prompts)
-import os
-import json
-checkpoint_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
-checkpoint_file = os.path.join(checkpoint_dir, "translation_checkpoint.jsonl")
-
-cached_results = {}
-if os.path.exists(checkpoint_file):
-self.logger.info("发现本地断点文件，正在读取已完成进度...")
-with open(checkpoint_file, "r", encoding="utf-8") as f:
-for line in f:
-try:
-record = json.loads(line.strip())
-                        # 仅加载真正成功的记录
-if record.get("status") == "success":
-                            cached_results[record["index"]] = record["result"]
-                            # 升级：使用 原文+模型ID 作为唯一钥匙，防止换小说/换模型串车
-                            cache_key = f"{record.get('prompt', '')}_{self.model_id}"
+    max_concurrent = (self.max_concurrent if max_concurrent is None else max_concurrent)
+    total = len(prompts)
+    
+    import os, json
+    out_dir = os.environ.get("DOCUTRANSLATE_OUTPUT_DIR", "/app/output")
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    checkpoint_file = os.path.join(out_dir, "translation_checkpoint.jsonl")
+    
+    cached_results = {}
+    if os.path.exists(checkpoint_file):
+        self.logger.info(f"检查到断点文件: {checkpoint_file}，尝试恢复...")
+        try:
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    record = json.loads(line)
+                    if record.get("status") == "success":
+                        p_text = record.get('prompt', '')
+                        if p_text in prompts:
+                            cache_key = f"{p_text}_{self.model_id}"
                             cached_results[cache_key] = record["result"]
-except:
-pass
-self.logger.info(f"已恢复 {len(cached_results)} 条历史成功记录。")
+        except Exception as e:
+            self.logger.warning(f"读取断点文件失败: {e}")
+    
+    if cached_results:
+        self.logger.info(f"已恢复 {len(cached_results)} 条匹配当前任务的记录。")
 
-rpm_info = f", RPM:{self.rate_limiter.rpm}" if self.rate_limiter.rpm else ""
-tpm_info = f", TPM:{self.rate_limiter.tpm}" if self.rate_limiter.tpm else ""
+    actual_send_count = sum(1 for p in prompts if f"{p}_{self.model_id}" not in cached_results)
+    self.logger.info(f"进度统计 - 总数: {total} | 跳过: {total - actual_send_count} | 需发送: {actual_send_count}")
 
-self.logger.info(
-f"provider:{self.provider},base-url:{self.baseurl},model-id:{self.model_id},concurrent:{max_concurrent}{rpm_info}{tpm_info},temperature:{self.temperature},system_proxy:{self.system_proxy_enable},json_output:{force_json}"
-)
-self.logger.info(f"预计发送{total}个请求")
+    self.total_error_counter.max_errors_count = len(prompts) // MAX_REQUESTS_PER_ERROR
+    self.unresolved_error_count = 0
+    self.token_counter.reset()
+    
+    count = 0
+    semaphore = asyncio.Semaphore(max_concurrent)
+    tasks = []
+    file_lock = asyncio.Lock()
+    
+    proxies = get_httpx_proxies(asyn=True) if self.system_proxy_enable else None
+    limits = httpx.Limits(max_connections=self.max_concurrent * 2, max_keepalive_connections=self.max_concurrent)
 
-self.total_error_counter.max_errors_count = (
-len(prompts) // MAX_REQUESTS_PER_ERROR
-)
+    async with httpx.AsyncClient(trust_env=False, mounts=proxies, verify=False, limits=limits) as client:
+        async def send_with_semaphore(index: int, p_text: str):
+            current_cache_key = f"{p_text}_{self.model_id}"
+            if current_cache_key in cached_results:
+                nonlocal count
+                count += 1
+                return cached_results[current_cache_key]
 
-self.unresolved_error_count = 0
-self.token_counter.reset()
+            async with semaphore:
+                has_failed = False
+                def wrapped_error_handler(p, log):
+                    nonlocal has_failed
+                    has_failed = True
+                    return error_result_handler(p, log) if error_result_handler else p
 
-count = 0
-semaphore = asyncio.Semaphore(max_concurrent)
-tasks = []
+                result = await self.send_async(
+                    client=client, prompt=p_text, system_prompt=system_prompt,
+                    force_json=force_json, pre_send_handler=pre_send_handler,
+                    result_handler=result_handler, error_result_handler=wrapped_error_handler,
+                )
 
-file_lock = asyncio.Lock()
+                async with file_lock:
+                    with open(checkpoint_file, "a", encoding="utf-8") as f:
+                        record = {
+                            "index": index,
+                            "status": "failed" if has_failed else "success",
+                            "prompt": p_text,
+                            "result": result,
+                            "model": self.model_id
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                
+                nonlocal count
+                count += 1
+                self.logger.info(f"协程-已完成{count}/{total}")
+                if self.progress_callback:
+                    self.progress_callback(count, total)
+                return result
 
-proxies = get_httpx_proxies(asyn=True) if self.system_proxy_enable else None
+        for i, p_text in enumerate(prompts):
+            task = asyncio.create_task(send_with_semaphore(i, p_text))
+            tasks.append(task)
 
-limits = httpx.Limits(
-max_connections=self.max_concurrent * 2,
-max_keepalive_connections=self.max_concurrent,
-)
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-async with httpx.AsyncClient(
-trust_env=False, mounts=proxies, verify=False, limits=limits
-) as client:
-async def send_with_semaphore(index: int, p_text: str):
-                if index in cached_results:
-                current_cache_key = f"{p_text}_{self.model_id}"
-                if current_cache_key in cached_results:
-nonlocal count
-count += 1
-                    return cached_results[index]
-                    return cached_results[current_cache_key]
+        self.logger.info(f"所有请求处理完毕。未解决的错误总数: {self.unresolved_error_count}")
+        token_stats = self.token_counter.get_stats()
+        self.logger.info(
+            f"Token使用统计 - 输入: {token_stats['input_tokens'] / 1000:.2f}K(含cached: {token_stats['cached_tokens'] / 1000:.2f}K), "
+            f"输出: {token_stats['output_tokens'] / 1000:.2f}K(含reasoning: {token_stats['reasoning_tokens'] / 1000:.2f}K), "
+            f"总计: {token_stats['total_tokens'] / 1000:.2f}K"
+        )
 
-async with semaphore:
-                    def mark_failure(p, log):
-                        return {"__is_failed__": True, "prompt": p}
-                    has_failed = False  # 新增：用于悄悄记录是否失败的开关
-
-                    actual_error_handler = error_result_handler or mark_failure
-                    # 使用闭包包裹原有的错误处理器
-                    def wrapped_error_handler(p, log):
-                        nonlocal has_failed
-                        has_failed = True  # 一旦进入这里，说明重试耗尽，彻底失败
-                        if error_result_handler:
-                            return error_result_handler(p, log) # 依然返回外部期望的内容
-                        return p
-
-result = await self.send_async(
-client=client,
-prompt=p_text,
-system_prompt=system_prompt,
-force_json=force_json,
-pre_send_handler=pre_send_handler,
-result_handler=result_handler,
-                        error_result_handler=actual_error_handler,
-                        error_result_handler=wrapped_error_handler, # 传入我们的包裹器
-)
-
-                    is_failed = isinstance(result, dict) and result.get("__is_failed__") is True
-
-                    # 3. 写入文件（精准写入状态）
-async with file_lock:
-with open(checkpoint_file, "a", encoding="utf-8") as f:
-record = {
-"index": index,
-                                "status": "failed" if is_failed else "success",
-                                "status": "failed" if has_failed else "success",
-                                "prompt": p_text,
-"result": result
-}
-f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-count += 1
-self.logger.info(f"协程-已完成{count}/{total}")
-if self.progress_callback:
-self.progress_callback(count, total)
-return result
- 
+        # ==================== 终极防误删检查 ====================
+        still_has_failed = False
+        if os.path.exists(checkpoint_file):
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if '"status": "failed"' in line:
+                        still_has_failed = True
+                        break
+        
+        if self.unresolved_error_count == 0 and not still_has_failed:
+            if os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                self.logger.info("任务已 100% 成功，已自动清理本地断点文件。")
+        else:
+            self.logger.warning(f"由于存在未完成项，保留断点文件供重试: {os.path.basename(checkpoint_file)}")
+                
+        return results
 
 for i, p_text in enumerate(prompts):
 task = asyncio.create_task(send_with_semaphore(i, p_text))
@@ -956,6 +959,18 @@ f"Token使用统计 - 输入: {token_stats['input_tokens'] / 1000:.2f}K(含cache
 f"输出: {token_stats['output_tokens'] / 1000:.2f}K(含reasoning: {token_stats['reasoning_tokens'] / 1000:.2f}K), "
 f"总计: {token_stats['total_tokens'] / 1000:.2f}K"
 )
+            # 如果所有的任务都跑完了，且没有一个失败项（也就是说没有生成带有 __is_failed__ 的字典）
+            if not any(isinstance(r, dict) and r.get("__is_failed__") for r in results):
+            # 检查结果列表中是否包含任何失败标记（字典类型且包含 __is_failed__）
+            has_any_failure = any(isinstance(r, dict) and r.get("__is_failed__") for r in results)
+            
+            if not has_any_failure:
+if os.path.exists(checkpoint_file):
+os.remove(checkpoint_file)
+                    self.logger.info(f"任务完美完成，已自动清理专属断点文件: {task_id[:8]}")
+                    self.logger.info("任务已 100% 成功完成，已自动清理本地断点文件。")
+            else:
+                self.logger.warning(f"由于存在 {results.count({'__is_failed__': True})} 个失败项，保留断点文件以供下次重试。")
 
 return results
 
