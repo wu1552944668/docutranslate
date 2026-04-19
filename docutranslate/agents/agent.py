@@ -619,10 +619,6 @@ class Agent:
                 with self.unresolved_error_lock:
                     self.unresolved_error_count += 1
 
-            if best_partial_result:
-                self.logger.info("所有重试失败，但存在部分翻译结果，将使用该结果。")
-                return best_partial_result
-
             return prompt if error_result_handler is None else error_result_handler(prompt, self.logger)
 
 
@@ -1001,10 +997,6 @@ class Agent:
                 self.logger.error(f"所有重试均失败，已达到重试次数上限。")
                 with self.unresolved_error_lock:
                     self.unresolved_error_count += 1
-
-            if best_partial_result:
-                self.logger.info("所有重试失败，但存在部分翻译结果，将使用该结果。")
-                return best_partial_result
 
             return prompt if error_result_handler is None else error_result_handler(prompt, self.logger)
 
