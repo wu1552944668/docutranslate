@@ -640,7 +640,7 @@ class Agent:
         if not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=True)
             
-        # ==================== 只认文件内容生成专属包厢 ====================
+        # ==================== 终极防骗：无论 task_id 怎么变，只认文件内容生成专属包厢 ====================
         task_body = "".join(prompts).encode("utf-8")
         task_hash = hashlib.md5(task_body).hexdigest()
         checkpoint_file = os.path.join(out_dir, f"checkpoint_hash_{task_hash[:12]}.jsonl")
@@ -691,9 +691,10 @@ class Agent:
 
         async with httpx.AsyncClient(trust_env=False, mounts=proxies, verify=False, limits=limits) as client:
             async def send_with_semaphore(index: int, p_text: str):
+                nonlocal count  # <=== 修复点：仅仅在这里声明一次！
+                
                 # 命中缓存，直接返回
                 if p_text in cached_results:
-                    nonlocal count
                     count += 1
                     return cached_results[p_text]
 
@@ -721,7 +722,6 @@ class Agent:
                             }
                             f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     
-                    nonlocal count
                     count += 1
                     self.logger.info(f"协程-已完成{count}/{total}")
                     if self.progress_callback:
